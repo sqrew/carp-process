@@ -4,27 +4,50 @@
 (use Process)
 
 (deftest process-test
-  (let [p-res (Process.spawn "ls" &[@"process.carp"])
+  (let [process-test-state (ref (Test.State.init 0 0))
+        
+        ;; Test 1: Simple Spawn & Wait
+        p-res (Process.spawn "ls" &[@"process.carp"])
         s1 (match p-res
              (Result.Success p) (let [exit-code (Process.wait &p)]
-                                  (assert-equal process-test 0 exit-code "Spawn 'ls' exits with 0"))
-             (Result.Error err) (assert-true process-test false &(format "Failed to spawn 'ls': %s" &err)))
+                                  (assert-equal process-test-state 0 exit-code "Spawn 'ls' exits with 0"))
+             (Result.Error err) (assert-true process-test-state false &(format "Failed to spawn 'ls': %s" &err)))
 
+        ;; Test 2: Command & Run (Capture Output)
         cmd2 (Command.new "echo")
         cmd-with-args2 (Command.arg cmd2 "hello carp")
         output2 (Process.run &cmd-with-args2)
         s2 (assert-equal &s1 "hello carp\n" (Process.Output.stdout &output2) "Capture stdout from 'echo'")
         s3 (assert-equal &s2 0 @(Process.Output.exit-code &output2) "Run 'echo' exits with 0")
 
+        ;; Test 3: Error Capture
         cmd3 (Command.new "ls")
         cmd-with-args3 (Command.arg cmd3 "non_existent_file_xyz")
         output3 (Process.run &cmd-with-args3)
         s4 (assert-true &s3 (not (= "" (Process.Output.stderr &output3))) "Capture stderr from failed 'ls'")
         s5 (assert-true &s4 (not (= 0 @(Process.Output.exit-code &output3))) "Failed 'ls' exits with non-zero")
 
+        ;; Test 4: Path search (spawnp-like behavior check)
         p-res4 (Process.spawn "sh" &[@"-c" @"exit 42"])
         s6 (match p-res4
              (Result.Success p) (let [exit-code (Process.wait &p)]
                                   (assert-equal &s5 42 exit-code "Custom exit code via 'sh'"))
-             (Result.Error err) (assert-true &s5 false &(format "Failed to spawn 'sh': %s" &err)))]
-    s6))
+             (Result.Error err) (assert-true &s5 false &(format "Failed to spawn 'sh': %s" &err)))
+
+        ;; Test 5: Deadlock prevention with run-combined (Large output)
+        ;; Using python to generate a large amount of combined stdout/stderr
+        cmd5 (Command.new "python3")
+        cmd5-args (Command.arg cmd5 "-c")
+        cmd5-args2 (Command.arg cmd5-args "import sys; print('o' * 100000); print('e' * 100000, file=sys.stderr)")
+        output5 (Process.run-combined &cmd5-args2)
+        s7 (assert-equal &s6 0 @(Process.Output.exit-code &output5) "Run-combined handles large output without deadlock")
+        s8 (assert-true &s7 (> (String.length (Process.Output.stdout &output5)) 200000) "Combined output contains both streams")
+
+        ;; Test 6: Exec failure (Command not found)
+        p-res6 (Process.spawn "definitely_not_a_real_command_12345" &[])
+        s9 (match p-res6
+             (Result.Success p) (let [exit-code (Process.wait &p)]
+                                  (assert-equal &s8 127 exit-code "Command not found exits with 127"))
+             (Result.Error err) (assert-true &s8 true "Spawn might return error on some systems if command not found early"))
+        ]
+    s9))

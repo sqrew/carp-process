@@ -3,6 +3,7 @@
 (system-include "errno.h")
 (system-include "stdio.h")
 (system-include "string.h")
+(system-include "fcntl.h")
 
 (defmodule Command
   (deftype T [
@@ -25,6 +26,7 @@
   (register pipe (Fn [(Ptr Int)] Int) "pipe")
   (register dup2 (Fn [Int Int] Int) "dup2")
   (register close (Fn [Int] Int) "close")
+  (register _exit (Fn [Int] ()) "_exit")
   (register-type PidT "pid_t")
 
   (register STDIN-FILENO Int "STDIN_FILENO")
@@ -49,28 +51,44 @@
        return argv;
      }")
 
-  (defn spawn [path args]
+  (defn spawn-with-options [path args merge-stderr]
     (let [out-pipe [0 0]
           err-pipe [0 0]]
-      (if (or (< (pipe (Pointer.address (Array.unsafe-nth &out-pipe 0))) 0)
-              (< (pipe (Pointer.address (Array.unsafe-nth &err-pipe 0))) 0))
-        (Result.Error @"Failed to create pipes")
-        (let [argv (to-argv (String.cstr path) args)
-              pid (fork)]
-          (cond
-            (< pid 0) (Result.Error @"Failed to fork")
-            (= pid 0) (do
-                        (ignore (close @(Array.unsafe-nth &out-pipe 0)))
-                        (ignore (close @(Array.unsafe-nth &err-pipe 0)))
-                        (ignore (dup2 @(Array.unsafe-nth &out-pipe 1) STDOUT-FILENO))
-                        (ignore (dup2 @(Array.unsafe-nth &err-pipe 1) STDERR-FILENO))
-                        (ignore (execvp (String.cstr path) argv))
-                        (System.exit 127)
-                        (Result.Error @"Unreachable"))
-            (do
+      (if (< (pipe (Pointer.address (Array.unsafe-nth &out-pipe 0))) 0)
+        (Result.Error @"Failed to create stdout pipe")
+        (if (and (not merge-stderr) (< (pipe (Pointer.address (Array.unsafe-nth &err-pipe 0))) 0))
+          (do (ignore (close @(Array.unsafe-nth &out-pipe 0)))
               (ignore (close @(Array.unsafe-nth &out-pipe 1)))
-              (ignore (close @(Array.unsafe-nth &err-pipe 1)))
-              (Result.Success (T.init pid @(Array.unsafe-nth &out-pipe 0) @(Array.unsafe-nth &err-pipe 0)))))))))
+              (Result.Error @"Failed to create stderr pipe"))
+          (let [argv (to-argv (String.cstr path) args)
+                pid (fork)]
+            (cond
+              (< pid 0) (do (ignore (close @(Array.unsafe-nth &out-pipe 0)))
+                            (ignore (close @(Array.unsafe-nth &out-pipe 1)))
+                            (if (not merge-stderr)
+                              (do (ignore (close @(Array.unsafe-nth &err-pipe 0)))
+                                  (ignore (close @(Array.unsafe-nth &err-pipe 1))))
+                              ())
+                            (Result.Error @"Failed to fork"))
+              (= pid 0) (do
+                          (ignore (close @(Array.unsafe-nth &out-pipe 0)))
+                          (ignore (dup2 @(Array.unsafe-nth &out-pipe 1) STDOUT-FILENO))
+                          (if merge-stderr
+                            (ignore (dup2 @(Array.unsafe-nth &out-pipe 1) STDERR-FILENO))
+                            (do (ignore (close @(Array.unsafe-nth &err-pipe 0)))
+                                (ignore (dup2 @(Array.unsafe-nth &err-pipe 1) STDERR-FILENO))))
+                          (ignore (execvp (String.cstr path) argv))
+                          (_exit 127)
+                          (Result.Error @"Unreachable"))
+              (do
+                (ignore (close @(Array.unsafe-nth &out-pipe 1)))
+                (let [err-read (if merge-stderr -1 @(Array.unsafe-nth &err-pipe 0))]
+                  (do
+                    (if (not merge-stderr) (ignore (close @(Array.unsafe-nth &err-pipe 1))) ())
+                    (Result.Success (T.init pid @(Array.unsafe-nth &out-pipe 0) err-read)))))))))))
+
+  (defn spawn [path args]
+    (spawn-with-options path args false))
 
   (defn wait [p]
     (let [status 0]
@@ -82,21 +100,23 @@
   (register memcpy (Fn [(Ptr CChar) (Ptr CChar) Int] (Ptr ())) "memcpy")
 
   (defn read-all [fd]
-    (let [buffer (String.allocate 1024 \0)
-          total @""
-          bytes-read 0]
-      (do
-        (while (do
-                 (set! bytes-read (read fd (String.cstr &buffer) 1024))
-                 (> bytes-read 0))
-          (do
-            (let [chunk (String.allocate bytes-read \b)]
-              (do
-                (ignore (memcpy (String.cstr &chunk) (String.cstr &buffer) bytes-read))
-                (let [new-total (String.append &total &chunk)]
-                  (do
-                    (set! total new-total)))))))
-        total)))
+    (if (< fd 0)
+      @""
+      (let [buffer (String.allocate 1024 \0)
+            total @""
+            bytes-read 0]
+        (do
+          (while (do
+                   (set! bytes-read (read fd (String.cstr &buffer) 1024))
+                   (> bytes-read 0))
+            (do
+              (let [chunk (String.allocate bytes-read \0)]
+                (do
+                  (ignore (memcpy (String.cstr &chunk) (String.cstr &buffer) bytes-read))
+                  (let [new-total (String.append &total &chunk)]
+                    (do
+                      (set! total new-total)))))))
+          total))))
 
   (deftype Output [
     stdout String
@@ -113,8 +133,18 @@
                                  exit-code (wait &p)]
                              (do
                                (ignore (close @(T.stdout &p)))
-                               (ignore (close @(T.stderr &p)))
+                               (if (>= @(T.stderr &p) 0) (ignore (close @(T.stderr &p))) ())
                                (Output.init stdout stderr exit-code))))))
+
+  (defn run-combined [cmd]
+    (let [p-res (spawn-with-options (Command.T.path cmd) (Command.T.args cmd) true)]
+      (match p-res
+        (Result.Error err) (Output.init @"" err -1)
+        (Result.Success p) (let [stdout (read-all @(T.stdout &p))
+                                 exit-code (wait &p)]
+                             (do
+                               (ignore (close @(T.stdout &p)))
+                               (Output.init stdout @"" exit-code))))))
 
   (register kill (Fn [Int Int] Int) "kill")
   (register SIGTERM Int "SIGTERM")
