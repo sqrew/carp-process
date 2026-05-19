@@ -24,7 +24,13 @@ A foundational subprocess management library for the [Carp](https://github.com/c
       (IO.println &(format "Exit code: %d" @(Output.exit-code &output))))))
 ```
 
-## API
+## Testing
+
+Run the test suite with:
+
+```bash
+carp -x test/process_test.carp
+```
 
 ### `Command`
 - `(Command.new path)`: Create a new command.

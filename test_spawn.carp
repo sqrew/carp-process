@@ -1,8 +1,0 @@
-(load "process.carp")
-
-(defn main []
-  (let [p-res (Process.spawn "ls" &[@"-la" @"process.carp"])]
-    (match p-res
-      (Result.Success p) (let [exit-code (Process.wait &p)]
-                           (IO.println &(format "Process exited with code: %d" exit-code)))
-      (Result.Error err) (IO.errorln &err))))

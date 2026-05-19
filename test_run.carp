@@ -1,9 +1,0 @@
-(load "process.carp")
-
-(defn main []
-  (let [cmd (Command.new "ls")
-        cmd-with-args (Command.arg cmd "-la")
-        output (Process.run &cmd-with-args)]
-    (do
-      (IO.println (Process.Output.stdout &output))
-      (IO.println &(format "Exit code: %d" @(Process.Output.exit-code &output))))))
