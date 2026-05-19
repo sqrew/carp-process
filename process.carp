@@ -1,0 +1,128 @@
+(system-include "unistd.h")
+(system-include "sys/wait.h")
+(system-include "errno.h")
+(system-include "stdio.h")
+(system-include "string.h")
+
+(defmodule Command
+  (deftype T [
+    path String
+    args (Array String)
+  ])
+
+  (defn new [path]
+    (T.init @path []))
+
+  (defn arg [c a]
+    (let [new-args (Array.push-back @(T.args &c) @a)]
+      (T.set-args c new-args)))
+)
+
+(defmodule Process
+  (register fork (Fn [] Int) "fork")
+  (register execvp (Fn [(Ptr CChar) (Ptr (Ptr CChar))] Int) "execvp")
+  (register waitpid (Fn [Int (Ptr Int) Int] Int) "waitpid")
+  (register pipe (Fn [(Ptr Int)] Int) "pipe")
+  (register dup2 (Fn [Int Int] Int) "dup2")
+  (register close (Fn [Int] Int) "close")
+  (register-type PidT "pid_t")
+
+  (register STDIN-FILENO Int "STDIN_FILENO")
+  (register STDOUT-FILENO Int "STDOUT_FILENO")
+  (register STDERR-FILENO Int "STDERR_FILENO")
+
+  (deftype T [
+    pid Int
+    stdout Int
+    stderr Int
+  ])
+
+  (deftemplate to-argv (Fn [(Ptr CChar) (Ref (Array String))] (Ptr (Ptr CChar)))
+    "char** $NAME(char* path, Array *a)"
+    "$DECL {
+       char** argv = CARP_MALLOC((a->len + 2) * sizeof(char*));
+       argv[0] = path;
+       for(int i = 0; i < a->len; i++) {
+         argv[i+1] = ((String*)a->data)[i];
+       }
+       argv[a->len + 1] = NULL;
+       return argv;
+     }")
+
+  (defn spawn [path args]
+    (let [out-pipe [0 0]
+          err-pipe [0 0]]
+      (if (or (< (pipe (Pointer.address (Array.unsafe-nth &out-pipe 0))) 0)
+              (< (pipe (Pointer.address (Array.unsafe-nth &err-pipe 0))) 0))
+        (Result.Error @"Failed to create pipes")
+        (let [argv (to-argv (String.cstr path) args)
+              pid (fork)]
+          (cond
+            (< pid 0) (Result.Error @"Failed to fork")
+            (= pid 0) (do
+                        (ignore (close @(Array.unsafe-nth &out-pipe 0)))
+                        (ignore (close @(Array.unsafe-nth &err-pipe 0)))
+                        (ignore (dup2 @(Array.unsafe-nth &out-pipe 1) STDOUT-FILENO))
+                        (ignore (dup2 @(Array.unsafe-nth &err-pipe 1) STDERR-FILENO))
+                        (ignore (execvp (String.cstr path) argv))
+                        (System.exit 127)
+                        (Result.Error @"Unreachable"))
+            (do
+              (ignore (close @(Array.unsafe-nth &out-pipe 1)))
+              (ignore (close @(Array.unsafe-nth &err-pipe 1)))
+              (Result.Success (T.init pid @(Array.unsafe-nth &out-pipe 0) @(Array.unsafe-nth &err-pipe 0)))))))))
+
+  (defn wait [p]
+    (let [status 0]
+      (do
+        (ignore (waitpid @(T.pid p) (Pointer.address &status) 0))
+        (System.get-exit-status status))))
+
+  (register read (Fn [Int (Ptr CChar) Int] Int) "read")
+  (register memcpy (Fn [(Ptr CChar) (Ptr CChar) Int] (Ptr ())) "memcpy")
+
+  (defn read-all [fd]
+    (let [buffer (String.allocate 1024 \0)
+          total @""
+          bytes-read 0]
+      (do
+        (while (do
+                 (set! bytes-read (read fd (String.cstr &buffer) 1024))
+                 (> bytes-read 0))
+          (do
+            (let [chunk (String.allocate bytes-read \b)]
+              (do
+                (ignore (memcpy (String.cstr &chunk) (String.cstr &buffer) bytes-read))
+                (let [new-total (String.append &total &chunk)]
+                  (do
+                    (set! total new-total)))))))
+        total)))
+
+  (deftype Output [
+    stdout String
+    stderr String
+    exit-code Int
+  ])
+
+  (defn run [cmd]
+    (let [p-res (spawn (Command.T.path cmd) (Command.T.args cmd))]
+      (match p-res
+        (Result.Error err) (Output.init @"" err -1)
+        (Result.Success p) (let [stdout (read-all @(T.stdout &p))
+                                 stderr (read-all @(T.stderr &p))
+                                 exit-code (wait &p)]
+                             (do
+                               (ignore (close @(T.stdout &p)))
+                               (ignore (close @(T.stderr &p)))
+                               (Output.init stdout stderr exit-code))))))
+
+  (register kill (Fn [Int Int] Int) "kill")
+  (register SIGTERM Int "SIGTERM")
+  (register SIGKILL Int "SIGKILL")
+
+  (defn terminate [p]
+    (kill @(T.pid p) SIGTERM))
+
+  (defn kill! [p]
+    (kill @(T.pid p) SIGKILL))
+)
