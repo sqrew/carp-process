@@ -35,7 +35,6 @@
              (Result.Error err) (assert-true &s5 false &(format "Failed to spawn 'sh': %s" &err)))
 
         ;; Test 5: Deadlock prevention with run-combined (Large output)
-        ;; Using python to generate a large amount of combined stdout/stderr
         cmd5 (Command.new "python3")
         cmd5-args (Command.arg cmd5 "-c")
         cmd5-args2 (Command.arg cmd5-args "import sys, threading;
@@ -68,5 +67,11 @@ t1.start(); t2.start(); t1.join(); t2.join()")
                                   (let [status (Process.wait &p)]
                                     (assert-true &s8 (not @(ExitStatus.exited? &status)) "Process killed by signal did not exit normally")))
              (Result.Error err) (assert-true &s8 false &(format "Failed to spawn 'sleep': %s" &err)))
+
+        ;; Test 8: Stdin piping
+        cmd8 (Command.new "cat")
+        cmd8-in (Command.set-stdin cmd8 "carp stdin test")
+        output8 (Process.run &cmd8-in)
+        s10 (assert-equal &s9 "carp stdin test" (Process.Output.stdout &output8) "Capture piped stdin from 'cat'")
         ]
-    s9))
+    s10))
