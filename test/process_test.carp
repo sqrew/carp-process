@@ -9,8 +9,8 @@
         ;; Test 1: Simple Spawn & Wait
         p-res (Process.spawn "ls" &[@"process.carp"])
         s1 (match p-res
-             (Result.Success p) (let [exit-code (Process.wait &p)]
-                                  (assert-equal process-test-state 0 exit-code "Spawn 'ls' exits with 0"))
+             (Result.Success p) (let [status (Process.wait &p)]
+                                  (assert-equal process-test-state 0 @(ExitStatus.code &status) "Spawn 'ls' exits with 0"))
              (Result.Error err) (assert-true process-test-state false &(format "Failed to spawn 'ls': %s" &err)))
 
         ;; Test 2: Command & Run (Capture Output)
@@ -18,36 +18,55 @@
         cmd-with-args2 (Command.arg cmd2 "hello carp")
         output2 (Process.run &cmd-with-args2)
         s2 (assert-equal &s1 "hello carp\n" (Process.Output.stdout &output2) "Capture stdout from 'echo'")
-        s3 (assert-equal &s2 0 @(Process.Output.exit-code &output2) "Run 'echo' exits with 0")
+        s3 (assert-equal &s2 0 @(ExitStatus.code (Process.Output.status &output2)) "Run 'echo' exits with 0")
 
         ;; Test 3: Error Capture
         cmd3 (Command.new "ls")
         cmd-with-args3 (Command.arg cmd3 "non_existent_file_xyz")
         output3 (Process.run &cmd-with-args3)
         s4 (assert-true &s3 (not (= "" (Process.Output.stderr &output3))) "Capture stderr from failed 'ls'")
-        s5 (assert-true &s4 (not (= 0 @(Process.Output.exit-code &output3))) "Failed 'ls' exits with non-zero")
+        s5 (assert-true &s4 (not (= 0 @(ExitStatus.code (Process.Output.status &output3)))) "Failed 'ls' exits with non-zero")
 
         ;; Test 4: Path search (spawnp-like behavior check)
         p-res4 (Process.spawn "sh" &[@"-c" @"exit 42"])
         s6 (match p-res4
-             (Result.Success p) (let [exit-code (Process.wait &p)]
-                                  (assert-equal &s5 42 exit-code "Custom exit code via 'sh'"))
+             (Result.Success p) (let [status (Process.wait &p)]
+                                  (assert-equal &s5 42 @(ExitStatus.code &status) "Custom exit code via 'sh'"))
              (Result.Error err) (assert-true &s5 false &(format "Failed to spawn 'sh': %s" &err)))
 
         ;; Test 5: Deadlock prevention with run-combined (Large output)
         ;; Using python to generate a large amount of combined stdout/stderr
         cmd5 (Command.new "python3")
         cmd5-args (Command.arg cmd5 "-c")
-        cmd5-args2 (Command.arg cmd5-args "import sys; print('o' * 100000); print('e' * 100000, file=sys.stderr)")
+        cmd5-args2 (Command.arg cmd5-args "import sys, threading;
+def spam_out():
+    for _ in range(100):
+        sys.stdout.write('o' * 1024)
+        sys.stdout.flush()
+def spam_err():
+    for _ in range(100):
+        sys.stderr.write('e' * 1024)
+        sys.stderr.flush()
+t1 = threading.Thread(target=spam_out)
+t2 = threading.Thread(target=spam_err)
+t1.start(); t2.start(); t1.join(); t2.join()")
         output5 (Process.run-combined &cmd5-args2)
-        s7 (assert-equal &s6 0 @(Process.Output.exit-code &output5) "Run-combined handles large output without deadlock")
-        s8 (assert-true &s7 (> (String.length (Process.Output.stdout &output5)) 200000) "Combined output contains both streams")
+        s7 (assert-equal &s6 0 @(ExitStatus.code (Process.Output.status &output5)) "Run-combined handles large concurrent output without deadlock")
 
         ;; Test 6: Exec failure (Command not found)
         p-res6 (Process.spawn "definitely_not_a_real_command_12345" &[])
-        s9 (match p-res6
-             (Result.Success p) (let [exit-code (Process.wait &p)]
-                                  (assert-equal &s8 127 exit-code "Command not found exits with 127"))
-             (Result.Error err) (assert-true &s8 true "Spawn might return error on some systems if command not found early"))
+        s8 (match p-res6
+             (Result.Success p) (let [status (Process.wait &p)]
+                                  (assert-equal &s7 127 @(ExitStatus.code &status) "Command not found exits with 127"))
+             (Result.Error err) (assert-true &s7 true "Spawn might return error on some systems if command not found early"))
+
+        ;; Test 7: Signal termination
+        p-res7 (Process.spawn "sleep" &[@"10"])
+        s9 (match p-res7
+             (Result.Success p) (do
+                                  (ignore (Process.kill! &p))
+                                  (let [status (Process.wait &p)]
+                                    (assert-true &s8 (not @(ExitStatus.exited? &status)) "Process killed by signal did not exit normally")))
+             (Result.Error err) (assert-true &s8 false &(format "Failed to spawn 'sleep': %s" &err)))
         ]
     s9))

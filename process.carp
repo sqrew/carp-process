@@ -33,10 +33,21 @@
   (register STDOUT-FILENO Int "STDOUT_FILENO")
   (register STDERR-FILENO Int "STDERR_FILENO")
 
+  (register WIFEXITED (Fn [Int] Bool) "WIFEXITED")
+  (register WIFSIGNALED (Fn [Int] Bool) "WIFSIGNALED")
+  (register WTERMSIG (Fn [Int] Int) "WTERMSIG")
+  (register WEXITSTATUS (Fn [Int] Int) "WEXITSTATUS")
+
   (deftype T [
     pid Int
     stdout Int
     stderr Int
+  ])
+
+  (deftype ExitStatus [
+    code Int
+    signal Int
+    exited? Bool
   ])
 
   (deftemplate to-argv (Fn [(Ptr CChar) (Ref (Array String))] (Ptr (Ptr CChar)))
@@ -69,18 +80,30 @@
                               (do (ignore (close @(Array.unsafe-nth &err-pipe 0)))
                                   (ignore (close @(Array.unsafe-nth &err-pipe 1))))
                               ())
+                            (ignore (Pointer.free (the (Ptr (Ptr CChar)) (Pointer.from-long (Pointer.to-long argv)))))
                             (Result.Error @"Failed to fork"))
               (= pid 0) (do
+                          ;; CHILD PROCESS
+                          ;; Close read ends immediately
                           (ignore (close @(Array.unsafe-nth &out-pipe 0)))
+                          (if (not merge-stderr) (ignore (close @(Array.unsafe-nth &err-pipe 0))) ())
+
+                          ;; Dup stdout and close original
                           (ignore (dup2 @(Array.unsafe-nth &out-pipe 1) STDOUT-FILENO))
-                          (if merge-stderr
-                            (ignore (dup2 @(Array.unsafe-nth &out-pipe 1) STDERR-FILENO))
-                            (do (ignore (close @(Array.unsafe-nth &err-pipe 0)))
-                                (ignore (dup2 @(Array.unsafe-nth &err-pipe 1) STDERR-FILENO))))
+                          (if (not merge-stderr)
+                            (do 
+                               (ignore (dup2 @(Array.unsafe-nth &err-pipe 1) STDERR-FILENO))
+                               (ignore (close @(Array.unsafe-nth &err-pipe 1))))
+                            (ignore (dup2 STDOUT-FILENO STDERR-FILENO)))
+                          
+                          (ignore (close @(Array.unsafe-nth &out-pipe 1)))
+
                           (ignore (execvp (String.cstr path) argv))
                           (_exit 127)
                           (Result.Error @"Unreachable"))
               (do
+                ;; PARENT PROCESS
+                (ignore (Pointer.free (the (Ptr (Ptr CChar)) (Pointer.from-long (Pointer.to-long argv)))))
                 (ignore (close @(Array.unsafe-nth &out-pipe 1)))
                 (let [err-read (if merge-stderr -1 @(Array.unsafe-nth &err-pipe 0))]
                   (do
@@ -94,7 +117,9 @@
     (let [status 0]
       (do
         (ignore (waitpid @(T.pid p) (Pointer.address &status) 0))
-        (System.get-exit-status status))))
+        (if (WIFEXITED status)
+          (ExitStatus.init (WEXITSTATUS status) 0 true)
+          (ExitStatus.init -1 (WTERMSIG status) false)))))
 
   (register read (Fn [Int (Ptr CChar) Int] Int) "read")
   (register memcpy (Fn [(Ptr CChar) (Ptr CChar) Int] (Ptr ())) "memcpy")
@@ -121,30 +146,34 @@
   (deftype Output [
     stdout String
     stderr String
-    exit-code Int
+    status Process.ExitStatus
   ])
 
+  (doc run "Runs a command and captures stdout and stderr separately.
+WARNING: This function is prone to deadlocks if the child process writes 
+large amounts of data to both stdout and stderr concurrently, filling up 
+the pipe buffers. For large or concurrent output, use run-combined.")
   (defn run [cmd]
     (let [p-res (spawn (Command.T.path cmd) (Command.T.args cmd))]
       (match p-res
-        (Result.Error err) (Output.init @"" err -1)
+        (Result.Error err) (Output.init @"" err (ExitStatus.init -1 0 false))
         (Result.Success p) (let [stdout (read-all @(T.stdout &p))
                                  stderr (read-all @(T.stderr &p))
-                                 exit-code (wait &p)]
+                                 status (wait &p)]
                              (do
                                (ignore (close @(T.stdout &p)))
                                (if (>= @(T.stderr &p) 0) (ignore (close @(T.stderr &p))) ())
-                               (Output.init stdout stderr exit-code))))))
+                               (Output.init stdout stderr status))))))
 
   (defn run-combined [cmd]
     (let [p-res (spawn-with-options (Command.T.path cmd) (Command.T.args cmd) true)]
       (match p-res
-        (Result.Error err) (Output.init @"" err -1)
+        (Result.Error err) (Output.init @"" err (ExitStatus.init -1 0 false))
         (Result.Success p) (let [stdout (read-all @(T.stdout &p))
-                                 exit-code (wait &p)]
+                                 status (wait &p)]
                              (do
                                (ignore (close @(T.stdout &p)))
-                               (Output.init stdout @"" exit-code))))))
+                               (Output.init stdout @"" status))))))
 
   (register kill (Fn [Int Int] Int) "kill")
   (register SIGTERM Int "SIGTERM")
